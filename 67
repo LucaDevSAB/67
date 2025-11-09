@@ -87,7 +87,7 @@ local function checkForPets(targetPetNames)
     return false, nil, nil
 end
 
--- Server-Liste mit Filter für volle Server
+-- Server-Liste - ALLE Server (auch volle)
 local function getAvailableServers()
     local servers = {}
     local cursor = ""
@@ -105,8 +105,8 @@ local function getAvailableServers()
         
         if success and result then
             for _, server in pairs(result.data) do
-                -- Filter: Nicht aktueller Server UND nicht voll
-                if server.id ~= game.JobId and server.playing < server.maxPlayers then
+                -- Nur aktuellen Server überspringen, ALLE anderen versuchen (auch volle)
+                if server.id ~= game.JobId then
                     table.insert(servers, server)
                 end
             end
@@ -129,58 +129,53 @@ end
 
 -- Server-Hopping mit Retry-Logik
 local function serverHopWithRetry(statusCallback)
-    local retryCount = 0
-    local serverIndex = 1
+    log("Hole Serverliste...", "INFO")
+    local servers = getAvailableServers()
     
-    while retryCount < CONFIG.MAX_RETRIES_PER_SERVER do
-        log("Hole Serverliste...", "INFO")
-        local servers = getAvailableServers()
-        
-        if #servers == 0 then
-            log("Keine verfügbaren Server gefunden - warte...", "WARNING")
-            if statusCallback then
-                statusCallback("Keine Server verfügbar\nWarte " .. CONFIG.RETRY_DELAY .. "s...")
-            end
-            wait(CONFIG.RETRY_DELAY)
-            retryCount = retryCount + 1
-            continue
+    if #servers == 0 then
+        log("Keine Server gefunden - warte und versuche erneut...", "WARNING")
+        if statusCallback then
+            statusCallback("Keine Server verfügbar\nWarte " .. CONFIG.RETRY_DELAY .. "s...")
+        end
+        wait(CONFIG.RETRY_DELAY)
+        return serverHopWithRetry(statusCallback) -- Rekursiv nochmal versuchen
+    end
+    
+    log(string.format("✓ %d Server gefunden (inkl. voller Server)", #servers), "SUCCESS")
+    
+    local teleportSuccessful = false
+    
+    -- Probiere jeden Server durch
+    for i, targetServer in ipairs(servers) do
+        local serverStatus = "OK"
+        if targetServer.playing >= targetServer.maxPlayers then
+            serverStatus = "VOLL"
         end
         
-        log(string.format("✓ %d verfügbare Server gefunden", #servers), "SUCCESS")
-        
-        -- Wähle nächsten Server
-        if serverIndex > #servers then
-            serverIndex = 1
-        end
-        
-        local targetServer = servers[serverIndex]
-        serverIndex = serverIndex + 1
-        
-        log(string.format("Versuche Server %d/%d: %s (%d/%d Spieler)", 
-            serverIndex - 1,
+        log(string.format("Versuche Server %d/%d [%s]: %s (%d/%d Spieler)", 
+            i,
             #servers,
+            serverStatus,
             targetServer.id:sub(1, 8), 
             targetServer.playing, 
             targetServer.maxPlayers
         ))
         
         if statusCallback then
-            statusCallback(string.format("Server %d/%d\nSpieler: %d/%d", 
-                serverIndex - 1, #servers, targetServer.playing, targetServer.maxPlayers))
+            statusCallback(string.format("Server %d/%d [%s]\nSpieler: %d/%d", 
+                i, #servers, serverStatus, targetServer.playing, targetServer.maxPlayers))
         end
         
-        -- Teleport mit Error-Handling
-        local teleportSuccess = false
-        local teleportAttempted = false
+        -- Teleport-Versuch mit Error-Handling
+        local teleportFailed = false
         
-        local function onTeleportFailed(...)
-            log("Teleport fehlgeschlagen - versuche nächsten Server", "ERROR")
-            teleportAttempted = true
-            teleportSuccess = false
-        end
+        -- Event-Handler für Teleport-Fehler (einmalig für diesen Versuch)
+        local failConnection = TeleportService.TeleportInitFailed:Connect(function(...)
+            log("Teleport fehlgeschlagen (Server voll oder Fehler)", "ERROR")
+            teleportFailed = true
+        end)
         
-        TeleportService.TeleportInitFailed:Connect(onTeleportFailed)
-        
+        -- Versuche Teleport
         local success, err = pcall(function()
             TeleportService:TeleportToPlaceInstance(
                 CONFIG.GAME_ID,
@@ -190,19 +185,37 @@ local function serverHopWithRetry(statusCallback)
         end)
         
         if not success then
+            -- Direkt Fehler beim Teleport-Aufruf
             log("Teleport-Error: " .. tostring(err), "ERROR")
-            log("Versuche nächsten Server...", "WARNING")
+            failConnection:Disconnect()
             wait(CONFIG.HOP_DELAY)
-            -- Nicht brechen, sondern nächsten Server versuchen
+            -- Weiter zum nächsten Server in der Schleife
         else
-            -- Teleport wurde initiiert - warte kurz
+            -- Teleport initiiert - warte auf Erfolg oder Fehler
             wait(2)
-            if not teleportAttempted then
-                -- Wenn nach 2 Sekunden kein Fehler kam, war es erfolgreich
+            failConnection:Disconnect()
+            
+            if not teleportFailed then
+                -- Erfolgreich! (wird zum neuen Server teleportiert)
+                log("✓ Teleport erfolgreich! Wechsle zu neuem Server...", "SUCCESS")
+                teleportSuccessful = true
                 break
+            else
+                -- Fehlgeschlagen - nächster Server
+                log("Server-Join fehlgeschlagen - nächster Versuch...", "WARNING")
+                wait(CONFIG.HOP_DELAY)
             end
         end
     end
+    
+    -- Nur weiter versuchen, wenn KEIN erfolgreicher Teleport
+    if not teleportSuccessful then
+        log("Alle Server durchprobiert - hole neue Liste...", "WARNING")
+        wait(CONFIG.RETRY_DELAY)
+        return serverHopWithRetry(statusCallback) -- Neue Serverliste holen und nochmal versuchen
+    end
+    
+    -- Bei erfolgreichem Teleport: Funktion beenden (Script wird auf neuem Server neu geladen)
 end
 
 -- Haupt-Loop - Läuft bis Pet gefunden
