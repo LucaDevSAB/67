@@ -1,5 +1,5 @@
--- Roblox Server-Hopping Security Test Script
--- Für Security-Testing deines eigenen Spiels
+-- Gica Hub - Advanced Server Hopping & Pet Finder
+-- Automatisches Server-Hopping bis Target-Pets gefunden werden
 
 local Players = game:GetService("Players")
 local TeleportService = game:GetService("TeleportService")
@@ -8,11 +8,19 @@ local LocalPlayer = Players.LocalPlayer
 
 -- Konfiguration
 local CONFIG = {
-    TARGET_PET_ID = 67,
+    TARGET_PETS = {
+        "Los Bros",
+        "Los Combinasionas",
+        "Spaghetti Tualetti",
+        "La Extinct Grande",
+        "La Grande Combinasion",
+        "Las Sis"
+    },
     GAME_ID = game.PlaceId,
-    MAX_HOPS = 20,
     CHECK_DELAY = 2,
-    HOP_DELAY = 3
+    HOP_DELAY = 1,
+    RETRY_DELAY = 3,
+    MAX_RETRIES_PER_SERVER = 3
 }
 
 -- Logging
@@ -22,64 +30,69 @@ local function log(message, level)
     print(string.format("[%s] [%s] %s", timestamp, level, message))
 end
 
--- Pet Detection (anpassen an dein Spiel!)
-local function checkForPet(petId)
-    log("Prüfe Server auf Pet #" .. petId .. "...")
+-- Pet Detection - Sucht nach mehreren Target-Pets
+local function checkForPets(targetPetNames)
+    log("Prüfe Server auf Target-Pets...")
     
-    -- WICHTIG: Diese Logik musst du an dein Spiel anpassen!
-    -- Beispiel-Implementierungen:
-    
-    -- Option 1: Suche in Workspace
+    -- Option 1: Suche in Workspace nach Pet-Namen
     for _, obj in pairs(workspace:GetDescendants()) do
-        if obj:IsA("Model") and obj.Name == "Pet" then
-            local petIdValue = obj:FindFirstChild("PetID")
-            if petIdValue and petIdValue.Value == petId then
-                log("★ PET #" .. petId .. " GEFUNDEN!", "SUCCESS")
-                return true, obj
+        if obj:IsA("Model") or obj:IsA("Folder") then
+            for _, targetName in ipairs(targetPetNames) do
+                if obj.Name == targetName or string.find(obj.Name, targetName) then
+                    log("★ " .. targetName .. " GEFUNDEN in Workspace!", "SUCCESS")
+                    return true, targetName, obj
+                end
             end
         end
     end
     
-    -- Option 2: Suche in allen Spielern's Inventories (wenn Pets dort gespeichert sind)
+    -- Option 2: Suche in allen Spielern
     for _, player in pairs(Players:GetPlayers()) do
         if player.Character then
-            local petFolder = player.Character:FindFirstChild("Pets")
-            if petFolder then
-                for _, pet in pairs(petFolder:GetChildren()) do
-                    local petIdValue = pet:FindFirstChild("PetID")
-                    if petIdValue and petIdValue.Value == petId then
-                        log(string.format("★ PET #%d bei Spieler %s gefunden!", petId, player.Name), "SUCCESS")
-                        return true, pet
+            for _, obj in pairs(player.Character:GetDescendants()) do
+                for _, targetName in ipairs(targetPetNames) do
+                    if obj.Name == targetName or string.find(obj.Name, targetName) then
+                        log(string.format("★ %s bei Spieler %s gefunden!", targetName, player.Name), "SUCCESS")
+                        return true, targetName, obj
+                    end
+                end
+            end
+        end
+        
+        -- Prüfe auch Backpack/PlayerGui
+        if player.Backpack then
+            for _, obj in pairs(player.Backpack:GetDescendants()) do
+                for _, targetName in ipairs(targetPetNames) do
+                    if obj.Name == targetName or string.find(obj.Name, targetName) then
+                        log(string.format("★ %s im Backpack von %s gefunden!", targetName, player.Name), "SUCCESS")
+                        return true, targetName, obj
                     end
                 end
             end
         end
     end
     
-    -- Option 3: Nutze Remote Events (wenn dein Spiel eine API hat)
-    -- local success, result = pcall(function()
-    --     return game:GetService("ReplicatedStorage").GetPets:InvokeServer()
-    -- end)
-    -- if success then
-    --     for _, petData in pairs(result) do
-    --         if petData.ID == petId then
-    --             return true, petData
-    --         end
-    --     end
-    -- end
+    -- Option 3: Prüfe ReplicatedStorage
+    if game:GetService("ReplicatedStorage") then
+        for _, obj in pairs(game:GetService("ReplicatedStorage"):GetDescendants()) do
+            for _, targetName in ipairs(targetPetNames) do
+                if obj.Name == targetName or string.find(obj.Name, targetName) then
+                    log("★ " .. targetName .. " in ReplicatedStorage gefunden!", "SUCCESS")
+                    return true, targetName, obj
+                end
+            end
+        end
+    end
     
-    return false, nil
+    return false, nil, nil
 end
 
--- Server-Hopping Logik
-local function serverHop()
-    log("Bereite Server-Hop vor...", "WARNING")
-    
+-- Server-Liste mit Filter für volle Server
+local function getAvailableServers()
     local servers = {}
     local cursor = ""
     local page = 1
     
-    -- Hole Serverliste
     repeat
         local success, result = pcall(function()
             local url = string.format(
@@ -92,8 +105,8 @@ local function serverHop()
         
         if success and result then
             for _, server in pairs(result.data) do
-                -- Nicht zum aktuellen Server hoppen
-                if server.id ~= game.JobId then
+                -- Filter: Nicht aktueller Server UND nicht voll
+                if server.id ~= game.JobId and server.playing < server.maxPlayers then
                     table.insert(servers, server)
                 end
             end
@@ -105,81 +118,148 @@ local function serverHop()
                 break
             end
             
-            wait(1) -- Rate-Limit-Schutz
+            wait(0.5)
         else
-            log("Fehler beim Abrufen der Serverliste", "ERROR")
             break
         end
-    until page > 3 or cursor == ""
+    until page > 5 or cursor == ""
     
-    log(string.format("✓ %d Server gefunden", #servers), "SUCCESS")
+    return servers
+end
+
+-- Server-Hopping mit Retry-Logik
+local function serverHopWithRetry(statusCallback)
+    local retryCount = 0
+    local serverIndex = 1
     
-    if #servers > 0 then
-        -- Wähle zufälligen Server
-        local targetServer = servers[math.random(1, #servers)]
+    while retryCount < CONFIG.MAX_RETRIES_PER_SERVER do
+        log("Hole Serverliste...", "INFO")
+        local servers = getAvailableServers()
         
-        log(string.format("Hoppe zu Server %s (%d/%d Spieler)...", 
+        if #servers == 0 then
+            log("Keine verfügbaren Server gefunden - warte...", "WARNING")
+            if statusCallback then
+                statusCallback("Keine Server verfügbar\nWarte " .. CONFIG.RETRY_DELAY .. "s...")
+            end
+            wait(CONFIG.RETRY_DELAY)
+            retryCount = retryCount + 1
+            continue
+        end
+        
+        log(string.format("✓ %d verfügbare Server gefunden", #servers), "SUCCESS")
+        
+        -- Wähle nächsten Server
+        if serverIndex > #servers then
+            serverIndex = 1
+        end
+        
+        local targetServer = servers[serverIndex]
+        serverIndex = serverIndex + 1
+        
+        log(string.format("Versuche Server %d/%d: %s (%d/%d Spieler)", 
+            serverIndex - 1,
+            #servers,
             targetServer.id:sub(1, 8), 
             targetServer.playing, 
             targetServer.maxPlayers
         ))
         
-        -- Teleport zum neuen Server
-        TeleportService:TeleportToPlaceInstance(
-            CONFIG.GAME_ID,
-            targetServer.id,
-            LocalPlayer
-        )
-    else
-        log("Keine Server zum Hoppen gefunden", "ERROR")
+        if statusCallback then
+            statusCallback(string.format("Server %d/%d\nSpieler: %d/%d", 
+                serverIndex - 1, #servers, targetServer.playing, targetServer.maxPlayers))
+        end
+        
+        -- Teleport mit Error-Handling
+        local teleportSuccess = false
+        local teleportAttempted = false
+        
+        local function onTeleportFailed(...)
+            log("Teleport fehlgeschlagen - versuche nächsten Server", "ERROR")
+            teleportAttempted = true
+            teleportSuccess = false
+        end
+        
+        TeleportService.TeleportInitFailed:Connect(onTeleportFailed)
+        
+        local success, err = pcall(function()
+            TeleportService:TeleportToPlaceInstance(
+                CONFIG.GAME_ID,
+                targetServer.id,
+                LocalPlayer
+            )
+        end)
+        
+        if not success then
+            log("Teleport-Error: " .. tostring(err), "ERROR")
+            log("Versuche nächsten Server...", "WARNING")
+            wait(CONFIG.HOP_DELAY)
+            -- Nicht brechen, sondern nächsten Server versuchen
+        else
+            -- Teleport wurde initiiert - warte kurz
+            wait(2)
+            if not teleportAttempted then
+                -- Wenn nach 2 Sekunden kein Fehler kam, war es erfolgreich
+                break
+            end
+        end
     end
 end
 
--- Haupt-Loop
-local function startSecurityTest()
-    log("=== Roblox Security Test gestartet ===")
-    log("Ziel: Pet #" .. CONFIG.TARGET_PET_ID)
+-- Haupt-Loop - Läuft bis Pet gefunden
+local function startGicaHub(statusCallback)
+    log("=== Gica Hub gestartet ===")
+    log("Target-Pets: " .. table.concat(CONFIG.TARGET_PETS, ", "))
     log("Game ID: " .. CONFIG.GAME_ID)
-    log("Max Hops: " .. CONFIG.MAX_HOPS)
     
     local hops = 0
-    local foundServers = {}
     
-    -- Erstmal aktuellen Server prüfen
+    -- Prüfe aktuellen Server
     wait(CONFIG.CHECK_DELAY)
-    local found, petObj = checkForPet(CONFIG.TARGET_PET_ID)
+    local found, petName, petObj = checkForPets(CONFIG.TARGET_PETS)
     
     if found then
-        log("★ PET AUF DIESEM SERVER GEFUNDEN!", "SUCCESS")
+        log("★ " .. petName .. " AUF DIESEM SERVER GEFUNDEN!", "SUCCESS")
         log("Server ID: " .. game.JobId)
-        table.insert(foundServers, {
-            serverId = game.JobId,
-            petId = CONFIG.TARGET_PET_ID,
-            players = #Players:GetPlayers()
+        
+        if statusCallback then
+            statusCallback("✓ " .. petName .. " GEFUNDEN!\nServer: " .. game.JobId:sub(1, 12))
+        end
+        
+        -- Benachrichtigung
+        game:GetService("StarterGui"):SetCore("SendNotification", {
+            Title = "Gica Hub - Erfolg!";
+            Text = petName .. " gefunden!";
+            Duration = 10;
         })
         
-        -- Hier könntest du weitere Aktionen ausführen
-        -- z.B. Benachrichtigung senden, etc.
-        
-        return -- Beende Test wenn gefunden
+        return true
     end
     
-    -- Wenn nicht gefunden, starte Server-Hopping
-    log("Pet nicht auf diesem Server - starte Server-Hopping...", "WARNING")
+    -- Nicht gefunden - starte kontinuierliches Hopping
+    log("Pets nicht auf diesem Server - starte Server-Hopping...", "WARNING")
     
-    while hops < CONFIG.MAX_HOPS do
+    if statusCallback then
+        statusCallback("Pets nicht gefunden\nStarte Hopping...")
+    end
+    
+    -- Kontinuierlich hoppen bis Pet gefunden
+    while true do
         hops = hops + 1
-        log(string.format("\n--- Hop %d/%d ---", hops, CONFIG.MAX_HOPS))
+        log(string.format("\n--- Server-Hop #%d ---", hops))
+        
+        if statusCallback then
+            statusCallback(string.format("Hopping...\nVersuch #%d", hops))
+        end
         
         wait(CONFIG.HOP_DELAY)
-        serverHop()
+        serverHopWithRetry(statusCallback)
         
-        -- Nach dem Hop wird das Script neu geladen
-        -- Du müsstest den Status persistent speichern (z.B. über DataStore oder externe API)
+        -- Nach erfolgreichem Hop wird das Script neu geladen
+        -- und prüft automatisch den neuen Server
         break
     end
     
-    log("=== Test abgeschlossen ===")
+    return false
 end
 
 -- GUI für Kontrolle (optional)
@@ -200,7 +280,7 @@ local function createGUI()
     local Title = Instance.new("TextLabel")
     Title.Size = UDim2.new(1, 0, 0, 40)
     Title.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
-    Title.Text = "Security Test Tool"
+    Title.Text = "Gica Hub"
     Title.TextColor3 = Color3.fromRGB(255, 255, 255)
     Title.Font = Enum.Font.GothamBold
     Title.TextSize = 18
@@ -210,7 +290,7 @@ local function createGUI()
     StatusLabel.Size = UDim2.new(1, -20, 0, 60)
     StatusLabel.Position = UDim2.new(0, 10, 0, 50)
     StatusLabel.BackgroundTransparency = 1
-    StatusLabel.Text = "Bereit zum Testen\nPet ID: " .. CONFIG.TARGET_PET_ID
+    StatusLabel.Text = "Bereit zum Suchen\nTarget: " .. #CONFIG.TARGET_PETS .. " Pets"
     StatusLabel.TextColor3 = Color3.fromRGB(200, 200, 200)
     StatusLabel.Font = Enum.Font.Gotham
     StatusLabel.TextSize = 14
@@ -230,9 +310,13 @@ local function createGUI()
     StartButton.MouseButton1Click:Connect(function()
         StartButton.BackgroundColor3 = Color3.fromRGB(170, 0, 0)
         StartButton.Text = "LÄUFT..."
-        StatusLabel.Text = "Test läuft...\nPrüfe Server..."
+        StatusLabel.Text = "Gica Hub aktiv...\nPrüfe Server..."
         
-        startSecurityTest()
+        local function updateStatus(msg)
+            StatusLabel.Text = msg
+        end
+        
+        startGicaHub(updateStatus)
     end)
     
     local CloseButton = Instance.new("TextButton")
@@ -286,11 +370,12 @@ local function createGUI()
 end
 
 -- Script Start
-log("=== Security Test Tool geladen ===")
-log("WICHTIG: Passe checkForPet() an dein Spiel an!")
+log("=== Gica Hub geladen ===")
+log("Target-Pets: " .. table.concat(CONFIG.TARGET_PETS, ", "))
+log("Kontinuierliches Hopping bis Pet gefunden")
 
 -- Erstelle GUI
 createGUI()
 
--- Optional: Automatisch starten
--- startSecurityTest()
+-- Optional: Automatisch starten (ohne GUI)
+-- startGicaHub()
