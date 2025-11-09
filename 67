@@ -1,0 +1,296 @@
+-- Roblox Server-Hopping Security Test Script
+-- Für Security-Testing deines eigenen Spiels
+
+local Players = game:GetService("Players")
+local TeleportService = game:GetService("TeleportService")
+local HttpService = game:GetService("HttpService")
+local LocalPlayer = Players.LocalPlayer
+
+-- Konfiguration
+local CONFIG = {
+    TARGET_PET_ID = 67,
+    GAME_ID = game.PlaceId,
+    MAX_HOPS = 20,
+    CHECK_DELAY = 2,
+    HOP_DELAY = 3
+}
+
+-- Logging
+local function log(message, level)
+    level = level or "INFO"
+    local timestamp = os.date("%H:%M:%S")
+    print(string.format("[%s] [%s] %s", timestamp, level, message))
+end
+
+-- Pet Detection (anpassen an dein Spiel!)
+local function checkForPet(petId)
+    log("Prüfe Server auf Pet #" .. petId .. "...")
+    
+    -- WICHTIG: Diese Logik musst du an dein Spiel anpassen!
+    -- Beispiel-Implementierungen:
+    
+    -- Option 1: Suche in Workspace
+    for _, obj in pairs(workspace:GetDescendants()) do
+        if obj:IsA("Model") and obj.Name == "Pet" then
+            local petIdValue = obj:FindFirstChild("PetID")
+            if petIdValue and petIdValue.Value == petId then
+                log("★ PET #" .. petId .. " GEFUNDEN!", "SUCCESS")
+                return true, obj
+            end
+        end
+    end
+    
+    -- Option 2: Suche in allen Spielern's Inventories (wenn Pets dort gespeichert sind)
+    for _, player in pairs(Players:GetPlayers()) do
+        if player.Character then
+            local petFolder = player.Character:FindFirstChild("Pets")
+            if petFolder then
+                for _, pet in pairs(petFolder:GetChildren()) do
+                    local petIdValue = pet:FindFirstChild("PetID")
+                    if petIdValue and petIdValue.Value == petId then
+                        log(string.format("★ PET #%d bei Spieler %s gefunden!", petId, player.Name), "SUCCESS")
+                        return true, pet
+                    end
+                end
+            end
+        end
+    end
+    
+    -- Option 3: Nutze Remote Events (wenn dein Spiel eine API hat)
+    -- local success, result = pcall(function()
+    --     return game:GetService("ReplicatedStorage").GetPets:InvokeServer()
+    -- end)
+    -- if success then
+    --     for _, petData in pairs(result) do
+    --         if petData.ID == petId then
+    --             return true, petData
+    --         end
+    --     end
+    -- end
+    
+    return false, nil
+end
+
+-- Server-Hopping Logik
+local function serverHop()
+    log("Bereite Server-Hop vor...", "WARNING")
+    
+    local servers = {}
+    local cursor = ""
+    local page = 1
+    
+    -- Hole Serverliste
+    repeat
+        local success, result = pcall(function()
+            local url = string.format(
+                "https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=Desc&limit=100&cursor=%s",
+                CONFIG.GAME_ID,
+                cursor
+            )
+            return HttpService:JSONDecode(game:HttpGet(url))
+        end)
+        
+        if success and result then
+            for _, server in pairs(result.data) do
+                -- Nicht zum aktuellen Server hoppen
+                if server.id ~= game.JobId then
+                    table.insert(servers, server)
+                end
+            end
+            
+            cursor = result.nextPageCursor or ""
+            page = page + 1
+            
+            if cursor == "" then
+                break
+            end
+            
+            wait(1) -- Rate-Limit-Schutz
+        else
+            log("Fehler beim Abrufen der Serverliste", "ERROR")
+            break
+        end
+    until page > 3 or cursor == ""
+    
+    log(string.format("✓ %d Server gefunden", #servers), "SUCCESS")
+    
+    if #servers > 0 then
+        -- Wähle zufälligen Server
+        local targetServer = servers[math.random(1, #servers)]
+        
+        log(string.format("Hoppe zu Server %s (%d/%d Spieler)...", 
+            targetServer.id:sub(1, 8), 
+            targetServer.playing, 
+            targetServer.maxPlayers
+        ))
+        
+        -- Teleport zum neuen Server
+        TeleportService:TeleportToPlaceInstance(
+            CONFIG.GAME_ID,
+            targetServer.id,
+            LocalPlayer
+        )
+    else
+        log("Keine Server zum Hoppen gefunden", "ERROR")
+    end
+end
+
+-- Haupt-Loop
+local function startSecurityTest()
+    log("=== Roblox Security Test gestartet ===")
+    log("Ziel: Pet #" .. CONFIG.TARGET_PET_ID)
+    log("Game ID: " .. CONFIG.GAME_ID)
+    log("Max Hops: " .. CONFIG.MAX_HOPS)
+    
+    local hops = 0
+    local foundServers = {}
+    
+    -- Erstmal aktuellen Server prüfen
+    wait(CONFIG.CHECK_DELAY)
+    local found, petObj = checkForPet(CONFIG.TARGET_PET_ID)
+    
+    if found then
+        log("★ PET AUF DIESEM SERVER GEFUNDEN!", "SUCCESS")
+        log("Server ID: " .. game.JobId)
+        table.insert(foundServers, {
+            serverId = game.JobId,
+            petId = CONFIG.TARGET_PET_ID,
+            players = #Players:GetPlayers()
+        })
+        
+        -- Hier könntest du weitere Aktionen ausführen
+        -- z.B. Benachrichtigung senden, etc.
+        
+        return -- Beende Test wenn gefunden
+    end
+    
+    -- Wenn nicht gefunden, starte Server-Hopping
+    log("Pet nicht auf diesem Server - starte Server-Hopping...", "WARNING")
+    
+    while hops < CONFIG.MAX_HOPS do
+        hops = hops + 1
+        log(string.format("\n--- Hop %d/%d ---", hops, CONFIG.MAX_HOPS))
+        
+        wait(CONFIG.HOP_DELAY)
+        serverHop()
+        
+        -- Nach dem Hop wird das Script neu geladen
+        -- Du müsstest den Status persistent speichern (z.B. über DataStore oder externe API)
+        break
+    end
+    
+    log("=== Test abgeschlossen ===")
+end
+
+-- GUI für Kontrolle (optional)
+local function createGUI()
+    local ScreenGui = Instance.new("ScreenGui")
+    ScreenGui.Name = "SecurityTestGUI"
+    ScreenGui.ResetOnSpawn = false
+    ScreenGui.Parent = game:GetService("CoreGui")
+    
+    local Frame = Instance.new("Frame")
+    Frame.Size = UDim2.new(0, 300, 0, 200)
+    Frame.Position = UDim2.new(0.5, -150, 0.5, -100)
+    Frame.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+    Frame.BorderSizePixel = 2
+    Frame.BorderColor3 = Color3.fromRGB(255, 255, 255)
+    Frame.Parent = ScreenGui
+    
+    local Title = Instance.new("TextLabel")
+    Title.Size = UDim2.new(1, 0, 0, 40)
+    Title.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
+    Title.Text = "Security Test Tool"
+    Title.TextColor3 = Color3.fromRGB(255, 255, 255)
+    Title.Font = Enum.Font.GothamBold
+    Title.TextSize = 18
+    Title.Parent = Frame
+    
+    local StatusLabel = Instance.new("TextLabel")
+    StatusLabel.Size = UDim2.new(1, -20, 0, 60)
+    StatusLabel.Position = UDim2.new(0, 10, 0, 50)
+    StatusLabel.BackgroundTransparency = 1
+    StatusLabel.Text = "Bereit zum Testen\nPet ID: " .. CONFIG.TARGET_PET_ID
+    StatusLabel.TextColor3 = Color3.fromRGB(200, 200, 200)
+    StatusLabel.Font = Enum.Font.Gotham
+    StatusLabel.TextSize = 14
+    StatusLabel.TextYAlignment = Enum.TextYAlignment.Top
+    StatusLabel.Parent = Frame
+    
+    local StartButton = Instance.new("TextButton")
+    StartButton.Size = UDim2.new(0, 120, 0, 40)
+    StartButton.Position = UDim2.new(0.5, -60, 1, -50)
+    StartButton.BackgroundColor3 = Color3.fromRGB(0, 170, 0)
+    StartButton.Text = "START TEST"
+    StartButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+    StartButton.Font = Enum.Font.GothamBold
+    StartButton.TextSize = 16
+    StartButton.Parent = Frame
+    
+    StartButton.MouseButton1Click:Connect(function()
+        StartButton.BackgroundColor3 = Color3.fromRGB(170, 0, 0)
+        StartButton.Text = "LÄUFT..."
+        StatusLabel.Text = "Test läuft...\nPrüfe Server..."
+        
+        startSecurityTest()
+    end)
+    
+    local CloseButton = Instance.new("TextButton")
+    CloseButton.Size = UDim2.new(0, 30, 0, 30)
+    CloseButton.Position = UDim2.new(1, -35, 0, 5)
+    CloseButton.BackgroundColor3 = Color3.fromRGB(170, 0, 0)
+    CloseButton.Text = "X"
+    CloseButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+    CloseButton.Font = Enum.Font.GothamBold
+    CloseButton.TextSize = 18
+    CloseButton.Parent = Frame
+    
+    CloseButton.MouseButton1Click:Connect(function()
+        ScreenGui:Destroy()
+    end)
+    
+    -- Draggable
+    local dragging, dragInput, dragStart, startPos
+    
+    Frame.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 then
+            dragging = true
+            dragStart = input.Position
+            startPos = Frame.Position
+        end
+    end)
+    
+    Frame.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 then
+            dragging = false
+        end
+    end)
+    
+    game:GetService("UserInputService").InputChanged:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseMovement then
+            dragInput = input
+        end
+    end)
+    
+    game:GetService("RunService").Heartbeat:Connect(function()
+        if dragging and dragInput then
+            local delta = dragInput.Position - dragStart
+            Frame.Position = UDim2.new(
+                startPos.X.Scale,
+                startPos.X.Offset + delta.X,
+                startPos.Y.Scale,
+                startPos.Y.Offset + delta.Y
+            )
+        end
+    end)
+end
+
+-- Script Start
+log("=== Security Test Tool geladen ===")
+log("WICHTIG: Passe checkForPet() an dein Spiel an!")
+
+-- Erstelle GUI
+createGUI()
+
+-- Optional: Automatisch starten
+-- startSecurityTest()
